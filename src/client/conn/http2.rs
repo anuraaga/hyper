@@ -23,12 +23,14 @@ use crate::rt::Timer;
 /// The sender side of an established connection.
 pub struct SendRequest<B> {
     dispatch: dispatch::UnboundedSender<Request<B>, Response<IncomingBody>>,
+    remote_settings: Arc<proto::h2::RemoteSettings>,
 }
 
 impl<B> Clone for SendRequest<B> {
     fn clone(&self) -> SendRequest<B> {
         SendRequest {
             dispatch: self.dispatch.clone(),
+            remote_settings: self.remote_settings.clone(),
         }
     }
 }
@@ -129,6 +131,32 @@ impl<B> SendRequest<B> {
     /// Checks if the connection side has been closed.
     pub fn is_closed(&self) -> bool {
         self.dispatch.is_closed()
+    }
+
+    /// Polls until the server's initial `SETTINGS` frame has been received.
+    ///
+    /// # Errors
+    ///
+    /// If the associated connection is closed, this returns an Error.
+    pub fn poll_remote_settings(&self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+        self.remote_settings.poll_initial(cx)
+    }
+
+    /// Waits until the server's initial `SETTINGS` frame has been received.
+    ///
+    /// # Errors
+    ///
+    /// If the associated connection is closed, this returns an Error.
+    pub async fn remote_settings(&self) -> crate::Result<()> {
+        crate::common::future::poll_fn(|cx| self.poll_remote_settings(cx)).await
+    }
+
+    /// Returns the server's current `SETTINGS_MAX_CONCURRENT_STREAMS`, or
+    /// `None` if its initial `SETTINGS` frame has not been received yet.
+    ///
+    /// The value may change throughout the connection's lifetime.
+    pub fn remote_max_send_streams(&self) -> Option<usize> {
+        self.remote_settings.max_send_streams()
     }
 }
 
@@ -582,9 +610,11 @@ where
             let (tx, rx) = dispatch::channel();
             let h2 = proto::h2::client::handshake(io, rx, &opts.h2_builder, opts.exec, opts.timer)
                 .await?;
+            let remote_settings = h2.remote_settings.clone();
             Ok((
                 SendRequest {
                     dispatch: tx.unbound(),
+                    remote_settings,
                 },
                 Connection {
                     inner: (PhantomData, h2),

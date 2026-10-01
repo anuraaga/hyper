@@ -3,11 +3,16 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
+    sync::{
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     time::Duration,
 };
 
 use crate::rt::{Read, Write};
+use atomic_waker::AtomicWaker;
 use bytes::Bytes;
 use futures_channel::mpsc::{Receiver, Sender};
 use futures_channel::{mpsc, oneshot};
@@ -37,6 +42,82 @@ type ClientRx<B> = crate::client::dispatch::Receiver<Request<B>, Response<Incomi
 ///// An mpsc channel is used to help notify the `Connection` task when *all*
 ///// other handles to it have been dropped, so that it can shutdown.
 type ConnDropRef = mpsc::Sender<Infallible>;
+
+/// What the connection task has learned from the server peer's `SETTINGS`,
+/// shared with the `SendRequest` handles so that callers can wait for the
+/// initial frame and read the current stream limit without the connection.
+pub(crate) struct RemoteSettings {
+    /// One of `WAITING`, `RECEIVED` or `CLOSED`.
+    state: AtomicU8,
+    max_send_streams: AtomicUsize,
+    waker: AtomicWaker,
+}
+
+/// No `SETTINGS` frame from the peer yet.
+const WAITING: u8 = 0;
+/// The peer's initial `SETTINGS` frame has been applied.
+const RECEIVED: u8 = 1;
+/// The connection closed before any `SETTINGS` frame arrived.
+const CLOSED: u8 = 2;
+
+impl RemoteSettings {
+    fn new() -> Self {
+        RemoteSettings {
+            state: AtomicU8::new(WAITING),
+            max_send_streams: AtomicUsize::new(0),
+            waker: AtomicWaker::new(),
+        }
+    }
+
+    /// `None` while waiting, `Ok` once the initial `SETTINGS` has been
+    /// applied, `Err` if the connection closed first.
+    fn done(&self) -> Option<crate::Result<()>> {
+        match self.state.load(Ordering::Acquire) {
+            WAITING => None,
+            RECEIVED => Some(Ok(())),
+            _ => Some(Err(crate::Error::new_closed())),
+        }
+    }
+
+    pub(crate) fn max_send_streams(&self) -> Option<usize> {
+        (self.state.load(Ordering::Acquire) == RECEIVED)
+            .then(|| self.max_send_streams.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn poll_initial(&self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+        self.waker.register(cx.waker());
+        match self.done() {
+            Some(done) => Poll::Ready(done),
+            None => Poll::Pending,
+        }
+    }
+
+    /// Records the peer's current settings. The first call also marks the
+    /// initial `SETTINGS` as received and wakes anyone waiting for it.
+    fn update(&self, max_send_streams: usize) {
+        self.max_send_streams
+            .store(max_send_streams, Ordering::Release);
+        if self
+            .state
+            .compare_exchange(WAITING, RECEIVED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.waker.wake();
+        }
+    }
+
+    /// Releases a waiter if the connection closed before any `SETTINGS`
+    /// arrived. A limit that was already received stays reported.
+    fn close(&self) {
+        if self
+            .state
+            .compare_exchange(WAITING, CLOSED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.waker.wake();
+        }
+    }
+}
 
 ///// A oneshot channel watches the `Connection` task, and when it completes,
 ///// the "dispatch" task will be notified and can shutdown sooner.
@@ -174,6 +255,7 @@ where
     let (cancel_tx, conn_eof) = oneshot::channel();
 
     let ping_config = new_ping_config(config);
+    let remote_settings = Arc::new(RemoteSettings::new());
 
     let (conn, ping) = if ping_config.is_enabled() {
         let pp = conn.ping_pong().expect("conn.ping_pong");
@@ -190,7 +272,7 @@ where
     };
 
     exec.execute_h2_future(H2ClientFuture::Task {
-        task: ConnTask::new(conn, conn_drop_rx, cancel_tx),
+        task: ConnTask::new(conn, conn_drop_rx, cancel_tx, remote_settings.clone()),
     });
 
     Ok(ClientTask {
@@ -201,6 +283,7 @@ where
         h2_tx,
         req_rx,
         fut_ctx: None,
+        remote_settings,
         marker: PhantomData,
     })
 }
@@ -290,6 +373,26 @@ where
     }
 }
 
+impl<T, B> ConnMapErr<T, B>
+where
+    B: Body,
+    T: Read + Write + Unpin,
+{
+    /// The server's current `SETTINGS_MAX_CONCURRENT_STREAMS`, once its
+    /// initial `SETTINGS` frame has been applied.
+    fn initial_max_send_streams(&self) -> Option<usize> {
+        let conn = match &self.conn {
+            Either::Left { fut } => &fut.conn,
+            Either::Right { fut } => fut,
+        };
+        if conn.has_received_initial_settings() {
+            Some(conn.max_concurrent_send_streams())
+        } else {
+            None
+        }
+    }
+}
+
 impl<T, B> FusedFuture for ConnMapErr<T, B>
 where
     B: Body,
@@ -314,6 +417,7 @@ pin_project! {
         cancel_tx: Option<oneshot::Sender<Infallible>>,
         #[pin]
         conn: ConnMapErr<T, B>,
+        remote_settings: Arc<RemoteSettings>,
     }
 }
 
@@ -326,11 +430,13 @@ where
         conn: ConnMapErr<T, B>,
         drop_rx: Receiver<Infallible>,
         cancel_tx: oneshot::Sender<Infallible>,
+        remote_settings: Arc<RemoteSettings>,
     ) -> Self {
         Self {
             drop_rx,
             cancel_tx: Some(cancel_tx),
             conn,
+            remote_settings,
         }
     }
 }
@@ -345,9 +451,15 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
 
-        if !this.conn.is_terminated() && Pin::new(&mut this.conn).poll(cx).is_ready() {
-            // ok or err, the `conn` has finished.
-            return Poll::Ready(());
+        if !this.conn.is_terminated() {
+            if Pin::new(&mut this.conn).poll(cx).is_ready() {
+                // ok or err, the `conn` has finished.
+                this.remote_settings.close();
+                return Poll::Ready(());
+            }
+            if let Some(max) = this.conn.as_ref().get_ref().initial_max_send_streams() {
+                this.remote_settings.update(max);
+            }
         }
 
         if !this.drop_rx.is_terminated() && Pin::new(&mut this.drop_rx).poll_next(cx).is_ready() {
@@ -434,6 +546,7 @@ where
     h2_tx: SendRequest<SendBuf<B::Data>>,
     req_rx: ClientRx<B>,
     fut_ctx: Option<FutCtx<B>>,
+    pub(crate) remote_settings: Arc<RemoteSettings>,
     marker: PhantomData<T>,
 }
 
