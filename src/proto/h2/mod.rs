@@ -18,8 +18,8 @@ pub(crate) mod upgrade;
 
 cfg_client! {
     pub(crate) mod client;
-pub(crate) use self::client::RemoteSettings;
     pub(crate) use self::client::ClientTask;
+    pub(crate) use self::client::RemoteSettings;
 }
 
 cfg_server! {
